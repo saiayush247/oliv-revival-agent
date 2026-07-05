@@ -1,6 +1,8 @@
 import streamlit as st
 import time
 import json
+import os
+from datetime import datetime
 from google import genai
 from google.genai import errors
 
@@ -52,6 +54,19 @@ st.markdown("""
     .priority-MEDIUM { color: #F59F00; font-weight: bold; }
     .priority-LOW { color: #2B8A3E; font-weight: bold; }
     .priority-NOT_RECOMMENDED { color: #868E96; font-weight: bold; }
+    .trace-entry {
+        background-color: #FFFFFF;
+        border: 1px solid #E9ECEF;
+        border-left: 4px solid #4C6EF5;
+        border-radius: 0 6px 6px 0;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        font-size: 0.85em;
+    }
+    .trace-meta {
+        color: #868E96;
+        font-size: 0.8em;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -132,6 +147,35 @@ If the Priority is LOW or NOT_RECOMMENDED, do not generate a Draft Outreach bloc
 """
 
 # ============================================================================
+# DECISION TRACE / AUDIT LOG
+# ----------------------------------------------------------------------------
+# Every agent run is appended to a persisted, queryable log — not just a
+# one-shot inference that disappears on the next rerun. This is the "system
+# of record for decisions" layer: what signal was seen, what the agent
+# concluded, why, and when. It's what lets a manager or another agent later
+# replay *why* a deal was flagged, not just *that* it was flagged.
+# ============================================================================
+DECISION_LOG_PATH = "decision_log.json"
+
+def load_decision_log():
+    if not os.path.exists(DECISION_LOG_PATH):
+        return []
+    try:
+        with open(DECISION_LOG_PATH, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+def append_to_decision_log(entry: dict):
+    log = load_decision_log()
+    log.append(entry)
+    try:
+        with open(DECISION_LOG_PATH, "w") as f:
+            json.dump(log, f, indent=2)
+    except OSError:
+        pass  # non-fatal: trace persistence shouldn't block the UI
+
+# ============================================================================
 # INITIALIZATION & ERROR HANDLING PIPELINE
 # ============================================================================
 if "client" not in st.session_state:
@@ -153,7 +197,7 @@ def execute_revival_analysis(deal: dict):
     """
     if st.session_state.client is None:
         return False, st.session_state.client_error or "Gemini client uninitialized."
-    
+
     prompt = f"""
     Evaluate the following historic deal data:
     - Company Name: {deal['company']}
@@ -162,10 +206,10 @@ def execute_revival_analysis(deal: dict):
     - Days Elapsed Since Activity: {deal['days_dormant']}
     - Recent Account Signal Detected: {deal['recent_signal']}
     """
-    
+
     max_retries = 3
     base_delay = 2.0
-    
+
     for attempt in range(max_retries):
         try:
             response = st.session_state.client.models.generate_content(
@@ -176,20 +220,17 @@ def execute_revival_analysis(deal: dict):
             if not response.text:
                 return False, "Live model returned an empty payload string. Please resubmit."
             return True, response.text
-            
+
         except errors.APIError as api_err:
-            # Check for Rate Limit / Quota Exhaustion
             if api_err.code == 429:
                 if "quota" in str(api_err).lower():
                     return False, "Live Model Failure: Gemini API Daily Free-Tier Quota completely exhausted. (Honest Error State)"
-                
-                # Exponential backoff for transient concurrency limits
                 time.sleep(base_delay * (2 ** attempt))
                 continue
             return False, f"Live model transaction failed with API error code {api_err.code}: {api_err.message}"
         except Exception as e:
             return False, f"Unexpected operational exception occurred during inference: {e}"
-            
+
     return False, "Transient rate limits encountered repeatedly. Operational timeout reached."
 
 # ============================================================================
@@ -201,7 +242,7 @@ st.write("---")
 
 st.markdown("""
 ### Concept Wedge: The CRM Graveyard
-While current platforms optimize for active, visible in-flight cycles, this agent focuses strictly on deep-mining historically dead pipeline data. Every assessment is structurally grounded in explicit signal matching—directly aligning with Oliv’s core architectural philosophy.
+While current platforms optimize for active, visible in-flight cycles, this agent focuses strictly on deep-mining historically dead pipeline data. Every assessment is structurally grounded in explicit signal matching, and every decision is written to a persisted trace — not a one-shot inference that vanishes on the next click — so the reasoning behind a revival call can be replayed and audited later, by a manager or by another agent downstream.
 """)
 
 col1, col2 = st.columns([1, 2])
@@ -209,8 +250,7 @@ col1, col2 = st.columns([1, 2])
 with col1:
     st.subheader("Unprocessed Cold Pipeline")
     st.write("Select a deal to stream through the agentic evaluation framework.")
-    
-    # Session state tracking to manage multi-deal views safely
+
     if "results" not in st.session_state:
         st.session_state.results = {}
     if "processing" not in st.session_state:
@@ -221,37 +261,51 @@ with col1:
             st.markdown(f"### {deal['company']} ({deal['amount']})")
             st.write(f"**Lost Reason:** *{deal['lost_reason']}*")
             st.markdown(f"<div class='evidence-box'>📡 Detected Signal: {deal['recent_signal']}</div>", unsafe_allow_html=True)
-            
+
             is_processing = deal['id'] in st.session_state.processing
             has_result = deal['id'] in st.session_state.results
-            
-            # Debounce architecture preventing double-execution and quota burning
+
             btn_label = "Analyzing..." if is_processing else ("Re-evaluate Signal" if has_result else "Run Agent Analysis")
-            
+
             if st.button(btn_label, key=deal['id'], disabled=is_processing):
                 st.session_state.processing.add(deal['id'])
                 st.rerun()
 
+    st.write("---")
+    st.subheader("📜 Decision Trace")
+    st.caption("Persisted log of every agent run — the record survives page reruns, not just this session.")
+    trace_log = load_decision_log()
+    if not trace_log:
+        st.caption("No decisions logged yet. Run an analysis to start the trace.")
+    else:
+        for entry in reversed(trace_log[-8:]):
+            st.markdown(f"""
+            <div class="trace-entry">
+                <span class="priority-{entry['priority']}">{entry['priority']}</span> — <b>{entry['company']}</b>
+                <div class="trace-meta">{entry['timestamp']}</div>
+                {entry['assessment']}
+            </div>
+            """, unsafe_allow_html=True)
+
 with col2:
     st.subheader("Agent Intelligence Output")
-    
-    # Handle deferred button execution state
+
     for deal in MOCK_DEALS:
         if deal['id'] in st.session_state.processing:
+            with st.spinner(f"Running agentic evaluation for {deal['company']}..."):
+                success, output = execute_revival_analysis(deal)
             st.session_state.processing.remove(deal['id'])
-            success, output = execute_revival_analysis(deal)
             st.session_state.results[deal['id']] = {"success": success, "payload": output}
             st.rerun()
 
-    # Display active evaluation logs
     active_selection = False
     for deal in MOCK_DEALS:
         if deal['id'] in st.session_state.results:
             active_selection = True
             res = st.session_state.results[deal['id']]
-            
+
             st.markdown(f"## {deal['company']} Diagnostic Summary")
-            
+
             if not res["success"]:
                 st.error(res["payload"])
             else:
@@ -259,7 +313,7 @@ with col2:
                 parsed_data = {}
                 outreach_block = []
                 in_outreach = False
-                
+
                 for line in lines:
                     if line.startswith("Signal Assessment:"):
                         parsed_data["assessment"] = line.replace("Signal Assessment:", "").strip()
@@ -271,14 +325,29 @@ with col2:
                         in_outreach = True
                     elif in_outreach:
                         outreach_block.append(line)
-                
+
                 priority = parsed_data.get("priority", "LOW")
-                
-                # Render structured summary matching Oliv visual paradigm without branding theft
+
                 st.markdown(f"#### Priority Rating: <span class='priority-{priority}'>{priority}</span>", unsafe_allow_html=True)
                 st.write(f"**Grounding Analysis:** {parsed_data.get('assessment', 'N/A')}")
                 st.write(f"**Strategic Approach:** {parsed_data.get('angle', 'N/A')}")
-                
+
+                # Write this run to the persisted decision trace exactly once
+                # per result (guarded so re-renders of the same result don't
+                # duplicate the log entry).
+                log_key = f"logged_{deal['id']}"
+                if log_key not in st.session_state:
+                    append_to_decision_log({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "deal_id": deal['id'],
+                        "company": deal['company'],
+                        "signal": deal['recent_signal'],
+                        "assessment": parsed_data.get('assessment', 'N/A'),
+                        "priority": priority,
+                        "angle": parsed_data.get('angle', 'N/A'),
+                    })
+                    st.session_state[log_key] = True
+
                 if outreach_block and priority in ["HIGH", "MEDIUM"]:
                     email_body = "\n".join(outreach_block).strip()
                     st.markdown("### 💬 Slack Delivery Preview")
@@ -292,6 +361,6 @@ with col2:
                     </div>
                     """, unsafe_allow_html=True)
             st.write("---")
-            
+
     if not active_selection:
         st.info("Select 'Run Agent Analysis' on any account card to initiate real-time reasoning loops across the LLM endpoint.")
