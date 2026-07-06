@@ -272,7 +272,31 @@ with col1:
                 st.rerun()
 
     st.write("---")
-    st.subheader("📜 Decision Trace")
+    trace_header_col, trace_reset_col = st.columns([3, 1])
+    with trace_header_col:
+        st.subheader("📜 Decision Trace")
+    with trace_reset_col:
+        if st.button("🗑️ Clear", key="clear_trace", help="Wipe the persisted decision log"):
+            st.session_state["confirm_clear_trace"] = True
+
+    if st.session_state.get("confirm_clear_trace"):
+        st.warning("This clears the log for everyone viewing this app, not just you.")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Yes, clear it", key="confirm_clear_trace_yes"):
+                if os.path.exists(DECISION_LOG_PATH):
+                    os.remove(DECISION_LOG_PATH)
+                # Also drop the per-result "already logged" guards so re-running
+                # a deal after a clear logs it again instead of silently skipping.
+                for k in [k for k in st.session_state.keys() if k.startswith("logged_")]:
+                    del st.session_state[k]
+                st.session_state["confirm_clear_trace"] = False
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", key="confirm_clear_trace_no"):
+                st.session_state["confirm_clear_trace"] = False
+                st.rerun()
+
     st.caption("Persisted log of every agent run — the record survives page reruns, not just this session.")
     trace_log = load_decision_log()
     if not trace_log:
