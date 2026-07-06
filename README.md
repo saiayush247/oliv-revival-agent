@@ -2,8 +2,6 @@
 
 A small prototype exploring a gap in Oliv's product surface: **dormant/lost pipeline**. While Oliv captures deal intelligence from live conversations, this agent re-evaluates *historically dead deals* against new account signals to decide which ones are actually worth reviving.
 
-**Live app:** [add link]
-**Walkthrough (2 min):** [add link]
 
 ## What it does
 
